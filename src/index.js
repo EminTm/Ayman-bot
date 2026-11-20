@@ -8,27 +8,42 @@ const DEFAULT_SETTINGS = {
   antiFlood: true,
   cleanService: true,
   welcomeEnabled: true,
+  autoDeleteBotMsgs: true,
+  aiModeration: true,
+  aiChat: true,
+  nightLockEnabled: false,
+  nightStart: "00:00",
+  nightEnd: "08:00",
+  nightIsLocked: false,
   welcomeText: "سلام {name} عزیز! به گروه خوش اومدی.\nلطفاً برای دیدن مقررات گروه، کلمه «قوانین» را بفرست.",
   rulesText: "۱. احترام به تمام اعضا الزامی است.\n۲. ارسال لینک، تبلیغات و فوروارد ممنوع است.\n۳. ارسال محتوای نامناسب باعث اخراج می‌شود.",
   maxWarns: 3,
-  warnAction: "mute", // "mute" or "ban"
+  warnAction: "mute",
   bannedWords: [],
   warns: {}
 };
 
+const SAFE_SHORT_WORDS = new Set([
+  "سلام", "علیکم", "درود", "خوبی", "چطوری", "مرسی", "ممنون", "سپاس",
+  "صبح بخیر", "شب بخیر", "خسته نباشید", "بله", "آره", "نه", "خیر",
+  "اوکی", "باشه", "حتما", "موافقم", "ok", "hi", "hello", "thanks"
+]);
+
 const adminCache = new Map();
 const floodCache = new Map();
+let cachedBotInfo = null;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
       return jsonRes({
         ok: true,
-        bot: "Persian Group Manager Bot",
+        bot: "Persian Group Manager Bot v2",
         kvConnected: Boolean(env.BOT_KV),
-        tokenSet: Boolean(env.BOT_TOKEN)
+        tokenSet: Boolean(env.BOT_TOKEN),
+        aiReady: Boolean(env.GROQ_API_KEY || env.GEMINI_API_KEY)
       });
     }
 
@@ -46,9 +61,9 @@ export default {
       try {
         const update = await request.json();
         if (update.callback_query) {
-          await handleCallback(env, update.callback_query);
+          await handleCallback(env, ctx, update.callback_query);
         } else if (update.message) {
-          await handleMessage(env, update.message);
+          await handleMessage(env, ctx, update.message);
         }
       } catch (err) {
         console.error("Update error:", err);
@@ -57,19 +72,24 @@ export default {
     }
 
     return new Response("Not Found", { status: 404 });
+  },
+
+  async scheduled(controller, env, ctx) {
+    if (!env.BOT_TOKEN || !env.BOT_KV) return;
+    await runNightLockSweep(env);
   }
 };
 
 async function handleSetup(env, url) {
   if (!env.BOT_TOKEN) {
-    return new Response("خطا: متغیر BOT_TOKEN در تنظیمات Cloudflare ثبت نشده است.", {
+    return new Response("خطا: متغیر BOT_TOKEN ثبت نشده است.", {
       status: 400,
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
   }
   const expectedKey = env.SETUP_KEY || "1234";
   if (url.searchParams.get("key") !== expectedKey) {
-    return new Response("کلید راه‌اندازی (key) اشتباه است.", {
+    return new Response("کلید راه‌اندازی اشتباه است.", {
       status: 403,
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
@@ -81,38 +101,29 @@ async function handleSetup(env, url) {
     allowed_updates: ["message", "callback_query"],
     drop_pending_updates: true
   };
-  if (env.WEBHOOK_SECRET) {
-    payload.secret_token = env.WEBHOOK_SECRET;
-  }
+  if (env.WEBHOOK_SECRET) payload.secret_token = env.WEBHOOK_SECRET;
 
   const res = await tg(env.BOT_TOKEN, "setWebhook", payload);
-  const kvNote = env.BOT_KV
-    ? "دیتابیس BOT_KV متصل است."
-    : "هشدار: دیتابیس BOT_KV هنوز متصل نشده؛ برای ذخیره دائمی تنظیمات از بخش Bindings متصلش کنید.";
-
   return new Response(
-    res.ok
-      ? `✅ ربات با موفقیت به تلگرام متصل شد!\nآدرس وب‌هوک: ${webhookUrl}\n${kvNote}`
-      : `❌ خطا در اتصال: ${JSON.stringify(res)}`,
+    res.ok ? `✅ ربات متصل شد!\nآدرس: ${webhookUrl}` : `❌ خطا: ${JSON.stringify(res)}`,
     { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } }
   );
 }
 
-async function handleMessage(env, msg) {
+async function handleMessage(env, ctx, msg) {
   const chat = msg.chat;
   if (!chat) return;
 
-  // چت خصوصی با ربات
   if (chat.type === "private") {
     const text = (msg.text || "").trim();
     if (text.startsWith("/start") || text === "راهنما" || text === "/help") {
       await sendText(
         env.BOT_TOKEN,
         chat.id,
-        "سلام! من ربات ۲۴ ساعته مدیریت گروه هستم.\n\n" +
-          "۱. من را به گروه خود اضافه کن.\n" +
-          "۲. در تنظیمات گروه، من را **ادمین (Admin)** کن (با دسترسی حذف پیام و مسدودسازی اعضا).\n" +
-          "۳. داخل گروه کلمه **پنل** یا **راهنما** را ارسال کن!"
+        "سلام! من ربات هوشمند ۲۴ ساعته مدیریت گروه هستم.\n\n" +
+          "۱. من را به گروه اضافه و **ادمین (Admin)** کن.\n" +
+          "۲. توی گروه بنویس **پنل** تا قفل شبانه، هوش مصنوعی و پاکسازی را تنظیم کنی.\n" +
+          "۳. اعضا می‌توانند با نوشتن **بات ...** یا ریپلای روی پیام‌های من سوال بپرسند!"
       );
     }
     return;
@@ -122,7 +133,6 @@ async function handleMessage(env, msg) {
 
   const settings = await getSettings(env, chat.id);
 
-  // ورود عضو جدید + قفل ربات + حذف پیام سیستمی
   if (msg.new_chat_members && msg.new_chat_members.length > 0) {
     if (settings.cleanService) {
       await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
@@ -132,13 +142,13 @@ async function handleMessage(env, msg) {
       if (member.is_bot) {
         if (settings.lockBots && !adderIsAdmin) {
           await tg(env.BOT_TOKEN, "banChatMember", { chat_id: chat.id, user_id: member.id });
-          await sendText(env.BOT_TOKEN, chat.id, `🤖 ربات غیرمجاز (${escapeHtml(member.first_name)}) توسط قفل ربات اخراج شد.`);
+          await sendTempText(env, ctx, chat.id, `🤖 ربات غیرمجاز (${escapeHtml(member.first_name)}) اخراج شد.`, settings);
         }
         continue;
       }
       if (settings.welcomeEnabled) {
         const welcome = settings.welcomeText.replaceAll("{name}", mentionUser(member));
-        await sendText(env.BOT_TOKEN, chat.id, welcome);
+        await sendTempText(env, ctx, chat.id, welcome, settings);
       }
     }
     return;
@@ -152,58 +162,88 @@ async function handleMessage(env, msg) {
   const isAdmin = await checkAdmin(env, chat.id, msg);
   const rawText = (msg.text || msg.caption || "").trim();
 
-  // دستورات عمومی اعضا
   if (rawText === "قوانین" || rawText === "/rules") {
     await sendText(env.BOT_TOKEN, chat.id, `📜 <b>قوانین گروه:</b>\n\n${escapeHtml(settings.rulesText)}`, msg.message_id);
     return;
   }
 
-  // اجرای دستورات ادمین
   if (isAdmin && rawText) {
-    const handled = await handleAdminCommand(env, msg, rawText, settings);
+    const handled = await handleAdminCommand(env, ctx, msg, rawText, settings);
     if (handled) return;
   }
 
-  // از اینجا به بعد فقط کاربران عادی بررسی می‌شوند
-  if (isAdmin) return;
-
-  // ضد رگبار پیام (Anti-Flood)
-  if (settings.antiFlood && msg.from) {
-    const isFlood = trackFlood(chat.id, msg.from.id);
-    if (isFlood) {
+  // بررسی قفل‌ها و ضد اسپم و فحش هوشمند فقط برای اعضای عادی
+  if (!isAdmin) {
+    if (settings.antiFlood && msg.from && trackFlood(chat.id, msg.from.id)) {
       await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
       await muteUser(env.BOT_TOKEN, chat.id, msg.from.id, 5);
-      await sendText(
-        env.BOT_TOKEN,
+      await sendTempText(
+        env,
+        ctx,
         chat.id,
-        `⏱ کاربر ${mentionUser(msg.from)} به دلیل ارسال رگباری پیام به مدت ۵ دقیقه سکوت شد.`
+        `⏱ کاربر ${mentionUser(msg.from)} به دلیل ارسال رگباری پیام به مدت ۵ دقیقه سکوت شد.`,
+        settings
       );
       return;
     }
+
+    let deleted = false;
+    if (settings.lockForward && isForwarded(msg)) deleted = true;
+    else if (settings.lockLink && hasLink(msg, rawText)) deleted = true;
+    else if (settings.lockMention && hasMention(msg, rawText)) deleted = true;
+    else if (settings.lockStickerGif && (msg.sticker || msg.animation)) deleted = true;
+    else if (settings.lockMedia && (msg.photo || msg.video || msg.voice || msg.audio || msg.document)) deleted = true;
+    else if (settings.bannedWords.length > 0 && rawText && hasBannedWord(rawText, settings.bannedWords)) deleted = true;
+
+    if (deleted) {
+      await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
+      return;
+    }
+
+    // بررسی فحش و ناسزای مخفی با هوش مصنوعی
+    if (settings.aiModeration && hasAiKey(env) && shouldCheckWithAi(rawText)) {
+      const mod = await checkToxicityAi(env, rawText);
+      if (mod?.toxic) {
+        await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
+        const who = msg.from ? mentionUser(msg.from) : "کاربر";
+        await sendTempText(
+          env,
+          ctx,
+          chat.id,
+          `🛡 پیام ${who} به دلیل الفاظ نامناسب یا توهین توسط هوش مصنوعی حذف شد.`,
+          settings
+        );
+        return;
+      }
+    }
   }
 
-  // بررسی قفل‌ها و کلمات ممنوعه
-  let violation = null;
-  if (settings.lockForward && isForwarded(msg)) {
-    violation = "فوروارد پیام";
-  } else if (settings.lockLink && hasLink(msg, rawText)) {
-    violation = "ارسال لینک";
-  } else if (settings.lockMention && hasMention(msg, rawText)) {
-    violation = "ارسال آیدی/منشن";
-  } else if (settings.lockStickerGif && (msg.sticker || msg.animation)) {
-    violation = "ارسال استیکر یا گیف";
-  } else if (settings.lockMedia && (msg.photo || msg.video || msg.voice || msg.audio || msg.document)) {
-    violation = "ارسال رسانه/فایل";
-  } else if (settings.bannedWords.length > 0 && rawText && hasBannedWord(rawText, settings.bannedWords)) {
-    violation = "استفاده از کلمه ممنوعه";
-  }
-
-  if (violation) {
-    await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
+  // پاسخ‌گویی هوشمند به اعضای گروه و ادمین‌ها
+  if (settings.aiChat && rawText) {
+    const botInfo = await getBotInfo(env);
+    const question = extractAiQuestion(msg, rawText, botInfo);
+    if (question !== null) {
+      if (!hasAiKey(env)) {
+        await sendTempText(
+          env,
+          ctx,
+          chat.id,
+          "⚠️ کلید هوش مصنوعی (GROQ_API_KEY) در تنظیمات کلودفلر وارد نشده است.",
+          settings,
+          msg.message_id
+        );
+        return;
+      }
+      const replyContext = msg.reply_to_message?.text || msg.reply_to_message?.caption || "";
+      const answer = await askAiAnswer(env, question, replyContext);
+      if (answer) {
+        await sendText(env.BOT_TOKEN, chat.id, escapeHtml(answer), msg.message_id);
+      }
+    }
   }
 }
 
-async function handleAdminCommand(env, msg, text, settings) {
+async function handleAdminCommand(env, ctx, msg, text, settings) {
   const chatId = msg.chat.id;
   const reply = msg.reply_to_message;
   const cmd = text.toLowerCase();
@@ -218,37 +258,69 @@ async function handleAdminCommand(env, msg, text, settings) {
     return true;
   }
 
-  // دستورات ریپلای‌محور
   if (text === "حذف" || cmd === "/del") {
     if (reply) await deleteMsg(env.BOT_TOKEN, chatId, reply.message_id);
     await deleteMsg(env.BOT_TOKEN, chatId, msg.message_id);
     return true;
   }
 
+  const cleanMatch = text.match(/^(?:پاکسازی|\/clean|\/purge)\s+(\d+)$/i);
+  if (cleanMatch) {
+    const count = Math.min(Math.max(parseInt(cleanMatch[1], 10), 1), 50);
+    const ids = [];
+    for (let i = 0; i <= count; i++) {
+      const id = msg.message_id - i;
+      if (id > 0) ids.push(id);
+    }
+    await tg(env.BOT_TOKEN, "deleteMessages", { chat_id: chatId, message_ids: ids });
+    await sendTempText(env, ctx, chatId, `🧹 تا ${count} پیام اخیر پاکسازی شد.`, settings);
+    return true;
+  }
+
+  const nightMatch = text.match(/^تنظیم شب\s+(\d{1,2}(?::\d{2})?)\s+(?:تا|الی|-)\s+(\d{1,2}(?::\d{2})?)$/);
+  if (nightMatch) {
+    const startStr = normalizeTimeStr(nightMatch[1]);
+    const endStr = normalizeTimeStr(nightMatch[2]);
+    if (!startStr || !endStr) {
+      await sendTempText(env, ctx, chatId, "❌ فرمت ساعت اشتباه است. مثال درست:\nتنظیم شب 23:30 تا 08:00", settings, msg.message_id);
+      return true;
+    }
+    settings.nightStart = startStr;
+    settings.nightEnd = endStr;
+    settings.nightLockEnabled = true;
+    await saveSettings(env, chatId, settings);
+    await sendText(
+      env.BOT_TOKEN,
+      chatId,
+      `🌙 قفل شبانه فعال شد: از ساعت <b>${startStr}</b> تا <b>${endStr}</b> به وقت ایران گروه خودکار بسته و سپس باز می‌شود.`,
+      msg.message_id
+    );
+    return true;
+  }
+
   if (text === "پین" || cmd === "/pin") {
     if (reply) {
       await tg(env.BOT_TOKEN, "pinChatMessage", { chat_id: chatId, message_id: reply.message_id });
-      await sendText(env.BOT_TOKEN, chatId, "📌 پیام پین شد.", msg.message_id);
+      await sendTempText(env, ctx, chatId, "📌 پیام پین شد.", settings, msg.message_id);
     }
     return true;
   }
 
   if (text === "انپین" || cmd === "/unpin") {
     await tg(env.BOT_TOKEN, "unpinChatMessage", { chat_id: chatId });
-    await sendText(env.BOT_TOKEN, chatId, "پین پیام برداشته شد.", msg.message_id);
+    await sendTempText(env, ctx, chatId, "پین پیام برداشته شد.", settings, msg.message_id);
     return true;
   }
 
   if ((text === "اخطار" || cmd === "/warn") && reply?.from) {
-    await issueWarn(env, chatId, reply.from, settings, msg.message_id);
+    await issueWarn(env, ctx, chatId, reply.from, settings, msg.message_id);
     return true;
   }
 
   if ((text === "حذف اخطار" || cmd === "/unwarn") && reply?.from) {
-    const uid = String(reply.from.id);
-    delete settings.warns[uid];
+    delete settings.warns[String(reply.from.id)];
     await saveSettings(env, chatId, settings);
-    await sendText(env.BOT_TOKEN, chatId, `✅ اخطارهای ${mentionUser(reply.from)} پاک شد.`, msg.message_id);
+    await sendTempText(env, ctx, chatId, `✅ اخطارهای ${mentionUser(reply.from)} پاک شد.`, settings, msg.message_id);
     return true;
   }
 
@@ -257,13 +329,13 @@ async function handleAdminCommand(env, msg, text, settings) {
     const minutes = numMatch ? parseInt(numMatch[1], 10) : 0;
     await muteUser(env.BOT_TOKEN, chatId, reply.from.id, minutes);
     const durText = minutes > 0 ? `به مدت ${minutes} دقیقه` : "به صورت دائم";
-    await sendText(env.BOT_TOKEN, chatId, `🔇 کاربر ${mentionUser(reply.from)} ${durText} سکوت شد.`, msg.message_id);
+    await sendTempText(env, ctx, chatId, `🔇 کاربر ${mentionUser(reply.from)} ${durText} سکوت شد.`, settings, msg.message_id);
     return true;
   }
 
   if ((text === "آزاد" || cmd === "/unmute") && reply?.from) {
     await unmuteUser(env.BOT_TOKEN, chatId, reply.from.id);
-    await sendText(env.BOT_TOKEN, chatId, `🔊 سکوت کاربر ${mentionUser(reply.from)} برداشته شد.`, msg.message_id);
+    await sendTempText(env, ctx, chatId, `🔊 سکوت کاربر ${mentionUser(reply.from)} برداشته شد.`, settings, msg.message_id);
     return true;
   }
 
@@ -271,31 +343,30 @@ async function handleAdminCommand(env, msg, text, settings) {
     await tg(env.BOT_TOKEN, "banChatMember", { chat_id: chatId, user_id: reply.from.id });
     if (text === "اخراج" || cmd === "/kick") {
       await tg(env.BOT_TOKEN, "unbanChatMember", { chat_id: chatId, user_id: reply.from.id, only_if_banned: true });
-      await sendText(env.BOT_TOKEN, chatId, `👢 کاربر ${mentionUser(reply.from)} از گروه اخراج شد.`, msg.message_id);
+      await sendTempText(env, ctx, chatId, `👢 کاربر ${mentionUser(reply.from)} از گروه اخراج شد.`, settings, msg.message_id);
     } else {
-      await sendText(env.BOT_TOKEN, chatId, `🚫 کاربر ${mentionUser(reply.from)} از گروه بن شد.`, msg.message_id);
+      await sendTempText(env, ctx, chatId, `🚫 کاربر ${mentionUser(reply.from)} از گروه بن شد.`, settings, msg.message_id);
     }
     return true;
   }
 
   if ((text === "آنبن" || cmd === "/unban") && reply?.from) {
     await tg(env.BOT_TOKEN, "unbanChatMember", { chat_id: chatId, user_id: reply.from.id, only_if_banned: true });
-    await sendText(env.BOT_TOKEN, chatId, `✅ محرومیت ${mentionUser(reply.from)} برداشته شد.`, msg.message_id);
+    await sendTempText(env, ctx, chatId, `✅ محرومیت ${mentionUser(reply.from)} برداشته شد.`, settings, msg.message_id);
     return true;
   }
 
-  // تنظیمات متنی گروه
   if (text.startsWith("تنظیم قوانین ")) {
     settings.rulesText = text.replace("تنظیم قوانین ", "").trim();
     await saveSettings(env, chatId, settings);
-    await sendText(env.BOT_TOKEN, chatId, "✅ قوانین جدید گروه ذخیره شد.", msg.message_id);
+    await sendTempText(env, ctx, chatId, "✅ قوانین جدید گروه ذخیره شد.", settings, msg.message_id);
     return true;
   }
 
   if (text.startsWith("تنظیم خوشامد ")) {
     settings.welcomeText = text.replace("تنظیم خوشامد ", "").trim();
     await saveSettings(env, chatId, settings);
-    await sendText(env.BOT_TOKEN, chatId, "✅ متن خوشامدگویی ذخیره شد (می‌توانید از {name} استفاده کنید).", msg.message_id);
+    await sendTempText(env, ctx, chatId, "✅ متن خوشامدگویی ذخیره شد.", settings, msg.message_id);
     return true;
   }
 
@@ -305,7 +376,7 @@ async function handleAdminCommand(env, msg, text, settings) {
       settings.bannedWords.push(word);
       await saveSettings(env, chatId, settings);
     }
-    await sendText(env.BOT_TOKEN, chatId, `✅ کلمه «${escapeHtml(word)}» به لیست فیلتر اضافه شد.`, msg.message_id);
+    await sendTempText(env, ctx, chatId, `✅ کلمه «${escapeHtml(word)}» به لیست فیلتر اضافه شد.`, settings, msg.message_id);
     return true;
   }
 
@@ -313,7 +384,7 @@ async function handleAdminCommand(env, msg, text, settings) {
     const word = text.replace(/^حذف کلمه\s+|^\/delword\s+/i, "").trim().toLowerCase();
     settings.bannedWords = settings.bannedWords.filter((w) => w !== word);
     await saveSettings(env, chatId, settings);
-    await sendText(env.BOT_TOKEN, chatId, `🗑 کلمه «${escapeHtml(word)}» از لیست فیلتر حذف شد.`, msg.message_id);
+    await sendTempText(env, ctx, chatId, `🗑 کلمه «${escapeHtml(word)}» از لیست فیلتر حذف شد.`, settings, msg.message_id);
     return true;
   }
 
@@ -326,7 +397,7 @@ async function handleAdminCommand(env, msg, text, settings) {
   return false;
 }
 
-async function handleCallback(env, cb) {
+async function handleCallback(env, ctx, cb) {
   const data = cb.data || "";
   const msg = cb.message;
   if (!msg || !msg.chat) return;
@@ -391,7 +462,207 @@ async function handleCallback(env, cb) {
   }
 }
 
-async function issueWarn(env, chatId, targetUser, settings, replyToId) {
+async function runNightLockSweep(env) {
+  const tehran = new Date(Date.now() + 3.5 * 60 * 60 * 1000);
+  const currentMins = tehran.getUTCHours() * 60 + tehran.getUTCMinutes();
+
+  let cursor;
+  do {
+    const listRes = await env.BOT_KV.list({ prefix: "group:", cursor });
+    for (const item of listRes.keys) {
+      const chatId = item.name.replace("group:", "");
+      const settings = await getSettings(env, chatId);
+      if (!settings.nightLockEnabled) continue;
+
+      const startMins = parseTimeMins(settings.nightStart);
+      const endMins = parseTimeMins(settings.nightEnd);
+      if (startMins === null || endMins === null) continue;
+
+      const shouldBeLocked = isTimeInRange(currentMins, startMins, endMins);
+
+      if (shouldBeLocked && !settings.nightIsLocked) {
+        await setGroupChatPermissions(env.BOT_TOKEN, chatId, false);
+        settings.nightIsLocked = true;
+        await saveSettings(env, chatId, settings);
+        await sendText(
+          env.BOT_TOKEN,
+          chatId,
+          `🌙 <b>قفل شبانه فعال شد</b>\nچت برای اعضای عادی تا ساعت <b>${settings.nightEnd}</b> به وقت ایران بسته است.`
+        );
+      } else if (!shouldBeLocked && settings.nightIsLocked) {
+        await setGroupChatPermissions(env.BOT_TOKEN, chatId, true);
+        settings.nightIsLocked = false;
+        await saveSettings(env, chatId, settings);
+        await sendText(
+          env.BOT_TOKEN,
+          chatId,
+          `☀️ <b>قفل شبانه برداشته شد</b>\nگروه باز شد و هم‌اکنون می‌توانید پیام ارسال کنید.`
+        );
+      }
+    }
+    cursor = listRes.list_complete ? undefined : listRes.cursor;
+  } while (cursor);
+}
+
+async function setGroupChatPermissions(token, chatId, open) {
+  await tg(token, "setChatPermissions", {
+    chat_id: chatId,
+    permissions: {
+      can_send_messages: open,
+      can_send_audios: open,
+      can_send_documents: open,
+      can_send_photos: open,
+      can_send_videos: open,
+      can_send_video_notes: open,
+      can_send_voice_notes: open,
+      can_send_polls: open,
+      can_send_other_messages: open,
+      can_add_web_page_previews: open
+    }
+  });
+}
+
+function normalizeTimeStr(raw) {
+  const parts = raw.split(":");
+  const h = parseInt(parts[0], 10);
+  const m = parts[1] !== undefined ? parseInt(parts[1], 10) : 0;
+  if (Number.isNaN(h) || Number.isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  const roundedM = m >= 30 ? 30 : 0;
+  return `${String(h).padStart(2, "0")}:${String(roundedM).padStart(2, "0")}`;
+}
+
+function parseTimeMins(str) {
+  const m = /^(\d{2}):(\d{2})$/.exec(str || "");
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+function isTimeInRange(now, start, end) {
+  if (start === end) return false;
+  if (start < end) return now >= start && now < end;
+  return now >= start || now < end;
+}
+
+function hasAiKey(env) {
+  return Boolean(env.GROQ_API_KEY || env.GEMINI_API_KEY);
+}
+
+function shouldCheckWithAi(text) {
+  if (!text || text.length < 2) return false;
+  const normalized = text.trim().toLowerCase().replace(/[.!؟،]+$/g, "");
+  if (SAFE_SHORT_WORDS.has(normalized)) return false;
+  return /[\p{L}\p{N}]/u.test(normalized);
+}
+
+async function checkToxicityAi(env, text) {
+  const sys =
+    "You are a Persian/Finglish group chat moderator. Detect severe profanity, sexual insults, slurs, or disguised swear words (with spaces, dots, symbols, or Finglish like k*r, kos, bi shooor). Ignore normal friendly banter or polite disagreement. Reply ONLY with valid JSON: {\"toxic\": true or false}";
+  const raw = await callBestAi(env, sys, text.slice(0, 600), 60, true);
+  if (!raw) return null;
+  try {
+    const first = raw.indexOf("{");
+    const last = raw.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      return JSON.parse(raw.slice(first, last + 1));
+    }
+  } catch {}
+  return null;
+}
+
+function extractAiQuestion(msg, rawText, botInfo) {
+  const triggerRegex = /^(?:هوش|بات|ربات|سوال|\/ai)\s+([\s\S]+)/i;
+  const match = rawText.match(triggerRegex);
+  if (match) return match[1].trim();
+
+  if (botInfo?.username) {
+    const mentionRegex = new RegExp(`@${botInfo.username}\\b`, "ig");
+    if (mentionRegex.test(rawText)) {
+      const cleaned = rawText.replace(mentionRegex, "").trim();
+      return cleaned || "سلام! چطور می‌تونم کمکت کنم؟";
+    }
+  }
+
+  if (botInfo?.id && msg.reply_to_message?.from?.id === botInfo.id) {
+    return rawText;
+  }
+
+  return null;
+}
+
+async function askAiAnswer(env, question, contextText) {
+  const sys =
+    "تو یک دستیار باهوش، مودب و صمیمی در یک گروه تلگرامی فارسی هستی. کوتاه، دقیق و روان به زبان فارسی پاسخ بده (حداکثر ۸ خط).";
+  const userContent = contextText
+    ? `پیام قبلی برای زمینه:\n${contextText.slice(0, 800)}\n\nسوال کاربر:\n${question.slice(0, 1000)}`
+    : question.slice(0, 1200);
+
+  return callBestAi(env, sys, userContent, 500, false);
+}
+
+async function callBestAi(env, systemPrompt, userPrompt, maxTokens, jsonMode) {
+  if (env.GROQ_API_KEY) {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.GROQ_API_KEY.trim()}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "qwen/qwen3.8-27b",
+        temperature: jsonMode ? 0 : 0.4,
+        max_tokens: maxTokens,
+        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ]
+      })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const text = data?.choices?.[0]?.message?.content?.trim();
+      if (text) return text;
+    }
+  }
+
+  if (env.GEMINI_API_KEY) {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY.trim(),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+        generationConfig: {
+          maxOutputTokens: maxTokens,
+          ...(jsonMode ? { responseMimeType: "application/json" } : {})
+        }
+      })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join("\n").trim();
+      if (text) return text;
+    }
+  }
+
+  return null;
+}
+
+async function getBotInfo(env) {
+  if (cachedBotInfo) return cachedBotInfo;
+  const res = await tg(env.BOT_TOKEN, "getMe", {});
+  if (res?.ok && res.result) {
+    cachedBotInfo = res.result;
+  }
+  return cachedBotInfo;
+}
+
+async function issueWarn(env, ctx, chatId, targetUser, settings, replyToId) {
   const uid = String(targetUser.id);
   const current = (settings.warns[uid] || 0) + 1;
   settings.warns[uid] = current;
@@ -401,10 +672,10 @@ async function issueWarn(env, chatId, targetUser, settings, replyToId) {
     await saveSettings(env, chatId, settings);
     if (settings.warnAction === "ban") {
       await tg(env.BOT_TOKEN, "banChatMember", { chat_id: chatId, user_id: targetUser.id });
-      await sendText(env.BOT_TOKEN, chatId, `🚫 کاربر ${mentionUser(targetUser)} به دلیل رسیدن به ${settings.maxWarns} اخطار از گروه بن شد.`, replyToId);
+      await sendTempText(env, ctx, chatId, `🚫 کاربر ${mentionUser(targetUser)} به دلیل ${settings.maxWarns} اخطار بن شد.`, settings, replyToId);
     } else {
       await muteUser(env.BOT_TOKEN, chatId, targetUser.id, 60);
-      await sendText(env.BOT_TOKEN, chatId, `🔇 کاربر ${mentionUser(targetUser)} به دلیل رسیدن به ${settings.maxWarns} اخطار، ۶۰ دقیقه سکوت شد.`, replyToId);
+      await sendTempText(env, ctx, chatId, `🔇 کاربر ${mentionUser(targetUser)} به دلیل ${settings.maxWarns} اخطار، ۶۰ دقیقه سکوت شد.`, settings, replyToId);
     }
     return;
   }
@@ -422,10 +693,10 @@ async function issueWarn(env, chatId, targetUser, settings, replyToId) {
 }
 
 async function sendPanel(env, chatId, settings) {
-  const kvWarn = env.BOT_KV ? "" : "\n⚠️ توجه: دیتابیس BOT_KV متصل نیست (تغییرات موقتی است).";
+  const aiNote = hasAiKey(env) ? "" : "\n⚠️ کلید هوش مصنوعی (GROQ_API_KEY) هنوز در کلودفلر ثبت نشده است.";
   await tg(env.BOT_TOKEN, "sendMessage", {
     chat_id: chatId,
-    text: `⚙️ <b>پنل مدیریت گروه</b>\nبرای تغییر هر مورد روی دکمه‌اش بزنید:${kvWarn}`,
+    text: `⚙️ <b>پنل مدیریت هوشمند گروه</b>\nبرای تغییر هر مورد روی دکمه‌اش بزنید:${aiNote}`,
     parse_mode: "HTML",
     reply_markup: buildPanelMarkup(settings)
   });
@@ -433,6 +704,7 @@ async function sendPanel(env, chatId, settings) {
 
 function buildPanelMarkup(s) {
   const icon = (v) => (v ? "🔒" : "🔓");
+  const sw = (v) => (v ? "✅" : "❌");
   const actText = s.warnAction === "mute" ? "سکوت ۱ ساعته" : "بن دائم";
   return {
     inline_keyboard: [
@@ -449,11 +721,21 @@ function buildPanelMarkup(s) {
         { text: `${icon(s.lockBots)} قفل ربات`, callback_data: "toggle:lockBots" }
       ],
       [
-        { text: `${s.antiFlood ? "✅" : "❌"} ضد اسپم رگباری`, callback_data: "toggle:antiFlood" },
-        { text: `${s.welcomeEnabled ? "✅" : "❌"} خوشامدگویی`, callback_data: "toggle:welcomeEnabled" }
+        { text: `${sw(s.antiFlood)} ضد اسپم رگباری`, callback_data: "toggle:antiFlood" },
+        { text: `${sw(s.welcomeEnabled)} خوشامدگویی`, callback_data: "toggle:welcomeEnabled" }
       ],
       [
-        { text: `${s.cleanService ? "✅" : "❌"} حذف ورود/خروج`, callback_data: "toggle:cleanService" },
+        { text: `${sw(s.cleanService)} حذف ورود/خروج`, callback_data: "toggle:cleanService" },
+        { text: `${sw(s.autoDeleteBotMsgs)} پاکسازی خودکار ربات`, callback_data: "toggle:autoDeleteBotMsgs" }
+      ],
+      [
+        { text: `${sw(s.aiModeration)} ضد فحش هوشمند AI`, callback_data: "toggle:aiModeration" },
+        { text: `${sw(s.aiChat)} پاسخ‌گویی AI`, callback_data: "toggle:aiChat" }
+      ],
+      [
+        { text: `${sw(s.nightLockEnabled)} قفل شب (${s.nightStart}-${s.nightEnd})`, callback_data: "toggle:nightLockEnabled" }
+      ],
+      [
         { text: `⚖️ مجازات ۳ اخطار: ${actText}`, callback_data: "cycle_warn" }
       ],
       [{ text: "بستن پنل ❌", callback_data: "close_panel" }]
@@ -464,16 +746,17 @@ function buildPanelMarkup(s) {
 function buildHelpText() {
   return (
     "📖 <b>راهنمای دستورات ادمین:</b>\n\n" +
-    "• <b>پنل</b> — باز کردن منوی شیشه‌ای قفل‌ها و تنظیمات\n" +
-    "• <b>اخطار</b> (ریپلای) — ثبت اخطار (۳ اخطار = مجازات)\n" +
-    "• <b>حذف اخطار</b> (ریپلای) — پاک کردن اخطارهای کاربر\n" +
-    "• <b>سکوت 60</b> یا <b>سکوت</b> (ریپلای) — سکوت ۶۰ دقیقه‌ای یا دائم\n" +
-    "• <b>آزاد</b> (ریپلای) — رفع سکوت کاربر\n" +
+    "• <b>پنل</b> — منوی شیشه‌ای قفل‌ها، AI و قفل شبانه\n" +
+    "• <b>تنظیم شب 23:30 تا 08:00</b> — ساعت قفل شبانه (به وقت ایران)\n" +
+    "• <b>پاکسازی 20</b> — حذف تا ۵۰ پیام اخیر گروه\n" +
+    "• <b>اخطار</b> / <b>حذف اخطار</b> (ریپلای)\n" +
+    "• <b>سکوت 60</b> یا <b>سکوت</b> / <b>آزاد</b> (ریپلای)\n" +
     "• <b>بن</b> / <b>اخراج</b> / <b>آنبن</b> (ریپلای)\n" +
     "• <b>حذف</b> / <b>پین</b> / <b>انپین</b> (ریپلای)\n" +
     "• <b>افزودن کلمه ...</b> / <b>حذف کلمه ...</b> / <b>لیست کلمات</b>\n" +
-    "• <b>تنظیم قوانین ...</b> / <b>تنظیم خوشامد ...</b>\n" +
-    "• <b>قوانین</b> — نمایش قوانین گروه برای همه"
+    "• <b>تنظیم قوانین ...</b> / <b>تنظیم خوشامد ...</b>\n\n" +
+    "🤖 <b>صحبت با هوش مصنوعی (برای همه اعضا):</b>\n" +
+    "بنویسید: <b>بات [سوال شما]</b> یا روی پیام ربات ریپلای کنید!"
   );
 }
 
@@ -546,9 +829,7 @@ async function muteUser(token, chatId, userId, minutes) {
       can_add_web_page_previews: false
     }
   };
-  if (minutes > 0) {
-    payload.until_date = Math.floor(Date.now() / 1000) + minutes * 60;
-  }
+  if (minutes > 0) payload.until_date = Math.floor(Date.now() / 1000) + minutes * 60;
   await tg(token, "restrictChatMember", payload);
 }
 
@@ -602,7 +883,19 @@ async function sendText(token, chatId, text, replyToId) {
     disable_web_page_preview: true
   };
   if (replyToId) payload.reply_to_message_id = replyToId;
-  await tg(token, "sendMessage", payload);
+  return tg(token, "sendMessage", payload);
+}
+
+async function sendTempText(env, ctx, chatId, text, settings, replyToId) {
+  const res = await sendText(env.BOT_TOKEN, chatId, text, replyToId);
+  const sentId = res?.result?.message_id;
+  if (settings.autoDeleteBotMsgs && sentId && ctx) {
+    ctx.waitUntil(
+      new Promise((resolve) => setTimeout(resolve, 15000)).then(() =>
+        deleteMsg(env.BOT_TOKEN, chatId, sentId)
+      )
+    );
+  }
 }
 
 async function deleteMsg(token, chatId, messageId) {
