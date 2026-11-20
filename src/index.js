@@ -40,7 +40,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/") {
       return jsonRes({
         ok: true,
-        bot: "Persian Group Manager Bot v2",
+        bot: "Persian Group Manager Bot v2.1",
         kvConnected: Boolean(env.BOT_KV),
         tokenSet: Boolean(env.BOT_TOKEN),
         aiReady: Boolean(env.GROQ_API_KEY || env.GEMINI_API_KEY)
@@ -172,7 +172,6 @@ async function handleMessage(env, ctx, msg) {
     if (handled) return;
   }
 
-  // بررسی قفل‌ها و ضد اسپم و فحش هوشمند فقط برای اعضای عادی
   if (!isAdmin) {
     if (settings.antiFlood && msg.from && trackFlood(chat.id, msg.from.id)) {
       await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
@@ -200,10 +199,9 @@ async function handleMessage(env, ctx, msg) {
       return;
     }
 
-    // بررسی فحش و ناسزای مخفی با هوش مصنوعی
     if (settings.aiModeration && hasAiKey(env) && shouldCheckWithAi(rawText)) {
       const mod = await checkToxicityAi(env, rawText);
-      if (mod?.toxic) {
+      if (mod?.result?.toxic) {
         await deleteMsg(env.BOT_TOKEN, chat.id, msg.message_id);
         const who = msg.from ? mentionUser(msg.from) : "کاربر";
         await sendTempText(
@@ -218,7 +216,6 @@ async function handleMessage(env, ctx, msg) {
     }
   }
 
-  // پاسخ‌گویی هوشمند به اعضای گروه و ادمین‌ها
   if (settings.aiChat && rawText) {
     const botInfo = await getBotInfo(env);
     const question = extractAiQuestion(msg, rawText, botInfo);
@@ -235,9 +232,11 @@ async function handleMessage(env, ctx, msg) {
         return;
       }
       const replyContext = msg.reply_to_message?.text || msg.reply_to_message?.caption || "";
-      const answer = await askAiAnswer(env, question, replyContext);
-      if (answer) {
-        await sendText(env.BOT_TOKEN, chat.id, escapeHtml(answer), msg.message_id);
+      const aiRes = await askAiAnswer(env, question, replyContext);
+      if (aiRes.text) {
+        await sendText(env.BOT_TOKEN, chat.id, escapeHtml(aiRes.text), msg.message_id);
+      } else if (aiRes.error) {
+        await sendTempText(env, ctx, chat.id, `⚠️ خطای هوش مصنوعی: ${escapeHtml(aiRes.error)}`, settings, msg.message_id);
       }
     }
   }
@@ -255,6 +254,37 @@ async function handleAdminCommand(env, ctx, msg, text, settings) {
 
   if (text === "راهنما" || cmd === "/help") {
     await sendText(env.BOT_TOKEN, chatId, buildHelpText(), msg.message_id);
+    return true;
+  }
+
+  if (text === "تست هوش") {
+    if (!hasAiKey(env)) {
+      await sendText(env.BOT_TOKEN, chatId, "❌ هیچ کلیدی (GROQ_API_KEY یا GEMINI_API_KEY) در تنظیمات کلودفلر ثبت نشده است.", msg.message_id);
+      return true;
+    }
+    const res = await callBestAi(env, "Reply with OK only.", "Say OK", 30, false);
+    if (res.text) {
+      await sendText(env.BOT_TOKEN, chatId, `✅ هوش مصنوعی فعال و آماده است (${escapeHtml(res.text)})`, msg.message_id);
+    } else {
+      await sendText(env.BOT_TOKEN, chatId, `❌ خطا در اتصال به هوش مصنوعی:\n${escapeHtml(res.error || "نامشخص")}`, msg.message_id);
+    }
+    return true;
+  }
+
+  if (text.startsWith("تست فحش ")) {
+    const sample = text.replace("تست فحش ", "").trim();
+    if (!hasAiKey(env)) {
+      await sendText(env.BOT_TOKEN, chatId, "❌ کلید هوش مصنوعی تنظیم نشده است.", msg.message_id);
+      return true;
+    }
+    const mod = await checkToxicityAi(env, sample);
+    if (mod.error) {
+      await sendText(env.BOT_TOKEN, chatId, `❌ خطای AI: ${escapeHtml(mod.error)}`, msg.message_id);
+    } else if (mod.result?.toxic) {
+      await sendText(env.BOT_TOKEN, chatId, "🚫 تشخیص AI: <b>فحش / ناسزا است</b> (برای اعضای عادی حذف می‌شود).", msg.message_id);
+    } else {
+      await sendText(env.BOT_TOKEN, chatId, "✅ تشخیص AI: متن عادی است (حذف نمی‌شود).", msg.message_id);
+    }
     return true;
   }
 
@@ -282,7 +312,7 @@ async function handleAdminCommand(env, ctx, msg, text, settings) {
     const startStr = normalizeTimeStr(nightMatch[1]);
     const endStr = normalizeTimeStr(nightMatch[2]);
     if (!startStr || !endStr) {
-      await sendTempText(env, ctx, chatId, "❌ فرمت ساعت اشتباه است. مثال درست:\nتنظیم شب 23:30 تا 08:00", settings, msg.message_id);
+      await sendTempText(env, ctx, chatId, "❌ فرمت ساعت اشتباه است. مثال:\nتنظیم شب 23:30 تا 08:00", settings, msg.message_id);
       return true;
     }
     settings.nightStart = startStr;
@@ -292,7 +322,7 @@ async function handleAdminCommand(env, ctx, msg, text, settings) {
     await sendText(
       env.BOT_TOKEN,
       chatId,
-      `🌙 قفل شبانه فعال شد: از ساعت <b>${startStr}</b> تا <b>${endStr}</b> به وقت ایران گروه خودکار بسته و سپس باز می‌شود.`,
+      `🌙 قفل شبانه فعال شد: از ساعت <b>${startStr}</b> تا <b>${endStr}</b> به وقت ایران گروه خودکار بسته و باز می‌شود.`,
       msg.message_id
     );
     return true;
@@ -556,17 +586,17 @@ function shouldCheckWithAi(text) {
 
 async function checkToxicityAi(env, text) {
   const sys =
-    "You are a Persian/Finglish group chat moderator. Detect severe profanity, sexual insults, slurs, or disguised swear words (with spaces, dots, symbols, or Finglish like k*r, kos, bi shooor). Ignore normal friendly banter or polite disagreement. Reply ONLY with valid JSON: {\"toxic\": true or false}";
-  const raw = await callBestAi(env, sys, text.slice(0, 600), 60, true);
-  if (!raw) return null;
+    "You are a strict Persian and Finglish chat moderator. Return toxic:true if the message contains ANY Persian/Finglish profanity, swear words, sexual/family insults, slurs, or severe disrespect (e.g., بیشعور, احمق, عوضی, کثافت, آشغال, خفه شو, گوه, کیر, کس, کون, جنده, پدرسگ, حرومزاده, or spaced/dotted variants like ب ی ش ع و ر, k*s, kos, kir, bi shoor). Only return toxic:false for normal polite/neutral messages. Respond ONLY with JSON: {\"toxic\":true} or {\"toxic\":false}.";
+  const res = await callBestAi(env, sys, text.slice(0, 600), 150, true);
+  if (!res.text) return { result: null, error: res.error };
   try {
-    const first = raw.indexOf("{");
-    const last = raw.lastIndexOf("}");
+    const first = res.text.indexOf("{");
+    const last = res.text.lastIndexOf("}");
     if (first >= 0 && last > first) {
-      return JSON.parse(raw.slice(first, last + 1));
+      return { result: JSON.parse(res.text.slice(first, last + 1)), error: null };
     }
   } catch {}
-  return null;
+  return { result: null, error: "پاسخ JSON نامعتبر از مدل" };
 }
 
 function extractAiQuestion(msg, rawText, botInfo) {
@@ -596,10 +626,12 @@ async function askAiAnswer(env, question, contextText) {
     ? `پیام قبلی برای زمینه:\n${contextText.slice(0, 800)}\n\nسوال کاربر:\n${question.slice(0, 1000)}`
     : question.slice(0, 1200);
 
-  return callBestAi(env, sys, userContent, 500, false);
+  return callBestAi(env, sys, userContent, 600, false);
 }
 
 async function callBestAi(env, systemPrompt, userPrompt, maxTokens, jsonMode) {
+  let lastError = null;
+
   if (env.GROQ_API_KEY) {
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -609,6 +641,7 @@ async function callBestAi(env, systemPrompt, userPrompt, maxTokens, jsonMode) {
       },
       body: JSON.stringify({
         model: "qwen/qwen3.8-27b",
+        reasoning_effort: "none",
         temperature: jsonMode ? 0 : 0.4,
         max_tokens: maxTokens,
         ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
@@ -621,7 +654,11 @@ async function callBestAi(env, systemPrompt, userPrompt, maxTokens, jsonMode) {
     if (res.ok) {
       const data = await res.json();
       const text = data?.choices?.[0]?.message?.content?.trim();
-      if (text) return text;
+      if (text) return { text, error: null };
+      lastError = "پاسخ Groq خالی بود";
+    } else {
+      const errBody = await res.text();
+      lastError = `Groq (${res.status}): ${errBody.slice(0, 120)}`;
     }
   }
 
@@ -646,11 +683,15 @@ async function callBestAi(env, systemPrompt, userPrompt, maxTokens, jsonMode) {
       const data = await res.json();
       const parts = data?.candidates?.[0]?.content?.parts || [];
       const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join("\n").trim();
-      if (text) return text;
+      if (text) return { text, error: null };
+      lastError = "پاسخ Gemini خالی بود";
+    } else {
+      const errBody = await res.text();
+      lastError = `Gemini (${res.status}): ${errBody.slice(0, 120)}`;
     }
   }
 
-  return null;
+  return { text: null, error: lastError };
 }
 
 async function getBotInfo(env) {
@@ -747,6 +788,7 @@ function buildHelpText() {
   return (
     "📖 <b>راهنمای دستورات ادمین:</b>\n\n" +
     "• <b>پنل</b> — منوی شیشه‌ای قفل‌ها، AI و قفل شبانه\n" +
+    "• <b>تست هوش</b> / <b>تست فحش [متن]</b> — تست عملکرد AI\n" +
     "• <b>تنظیم شب 23:30 تا 08:00</b> — ساعت قفل شبانه (به وقت ایران)\n" +
     "• <b>پاکسازی 20</b> — حذف تا ۵۰ پیام اخیر گروه\n" +
     "• <b>اخطار</b> / <b>حذف اخطار</b> (ریپلای)\n" +
