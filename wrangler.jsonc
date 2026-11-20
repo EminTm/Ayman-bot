@@ -1,5 +1,8 @@
 {
-  "name": "tg-group-manager",
+  "name": "ayman-bot",
   "main": "src/index.js",
-  "compatibility_date": "2026-10-01"
+  "compatibility_date": "2026-10-01",
+  "triggers": {
+    "crons": ["0,30 * * * *"]
+  }
 }
